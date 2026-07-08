@@ -1,0 +1,10 @@
+## Interface: 20506, 20505
+## Title: NextCast
+## Notes: Suggests your next cast (Shadow Priest) and tracks your debuffs on the target.
+## Author: beckerbi
+## Version: 1.0.0
+## IconTexture: Interface\Icons\Spell_Shadow_Shadowform
+## X-License: MIT
+## SavedVariables: NextCastDB
+
+NextCast.lua
