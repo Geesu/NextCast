@@ -2,7 +2,7 @@
 ## Title: NextCast
 ## Notes: Suggests your next cast (Shadow Priest) and tracks your debuffs on the target.
 ## Author: beckerbi
-## Version: 1.0.0
+## Version: 1.0.1
 ## IconTexture: Interface\Icons\Spell_Shadow_Shadowform
 ## X-License: MIT
 ## SavedVariables: NextCastDB

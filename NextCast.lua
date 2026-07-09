@@ -21,6 +21,9 @@ local SPELLS = {
     swd         = 32379, -- Shadow Word: Death
     mindflay    = 15407,
     shadowfiend = 34433,
+    dp          = 2944,  -- Devouring Plague (Undead racial)
+    starshards  = 10797, -- Starshards (Night Elf racial)
+    innerfocus  = 14751, -- Inner Focus (Discipline talent)
 }
 
 local spellName, spellIcon = {}, {}
@@ -47,6 +50,10 @@ end
 
 local GCD = 1.5
 
+local function Print(msg)
+    DEFAULT_CHAT_FRAME:AddMessage("|cff9482c9NextCast:|r " .. msg)
+end
+
 -- Live cast time (seconds) for a known spell; GetSpellInfo's cast time
 -- already reflects current spell haste, so this shortens under Bloodlust etc.
 local function CastTime(key)
@@ -55,6 +62,13 @@ local function CastTime(key)
         return castMS / 1000
     end
     return GCD
+end
+
+-- World latency in seconds, folded into DoT refresh windows so recasts
+-- land on time at real ping, not just at zero.
+local function Latency()
+    local _, _, _, world = GetNetStats()
+    return (world or 0) / 1000
 end
 
 -- Remaining cooldown for a spell, ignoring the GCD.
@@ -134,7 +148,7 @@ end
 -- exactly once; everything else reads from these caches. No tables are
 -- allocated per update.
 
-local dotKeys = { "swp", "vt", "ve" }
+local dotKeys = { "swp", "vt", "ve", "dp", "starshards" }
 
 local trackedDebuffs = {}
 for _, key in ipairs(dotKeys) do
@@ -142,7 +156,7 @@ for _, key in ipairs(dotKeys) do
 end
 
 local debuffExpiry, debuffDuration = {}, {}
-local hasShadowform, hasLust = false, false
+local hasShadowform, hasLust, hasInnerFocus = false, false, false
 
 local function ScanAuras()
     for name in pairs(debuffExpiry) do
@@ -157,11 +171,12 @@ local function ScanAuras()
             debuffDuration[dName] = duration or 0
         end
     end
-    hasShadowform, hasLust = false, false
+    hasShadowform, hasLust, hasInnerFocus = false, false, false
     for i = 1, 40 do
         local bName = UnitBuff("player", i)
         if not bName then break end
         if bName == spellName.shadowform then hasShadowform = true end
+        if bName == spellName.innerfocus then hasInnerFocus = true end
         if lustNames[bName] then hasLust = true end
     end
 end
@@ -189,6 +204,11 @@ local defaults = {
     useFiend = true,
     useLust = true,
     useClip = true,
+    useOOM = true,
+    useRacial = true,
+    useFocus = true,
+    useTTD = true,
+    useReport = true,
     fiendManaPct = 50,
     point = { "CENTER", 0, -120 },
 }
@@ -219,7 +239,9 @@ local DOT_SPACING = 3
 local ROW_WIDTH = DOT_SIZE * 3 + DOT_SPACING * 2
 
 local frame = CreateFrame("Frame", "NextCastFrame", UIParent)
-frame:SetSize(ROW_WIDTH + 8, ICON_SIZE + DOT_SIZE + 14)
+frame:SetSize(ROW_WIDTH + 8, ICON_SIZE + DOT_SIZE + 14 + 17)
+-- draw above action bars and other standard UI so nothing overlaps the text
+frame:SetFrameStrata("HIGH")
 frame:SetMovable(true)
 frame:SetClampedToScreen(true)
 frame:RegisterForDrag("LeftButton")
@@ -247,7 +269,7 @@ frame.label:Hide()
 -- Main suggestion icon
 frame.icon = frame:CreateTexture(nil, "ARTWORK")
 frame.icon:SetSize(ICON_SIZE, ICON_SIZE)
-frame.icon:SetPoint("TOP", frame, "TOP", 0, -4)
+frame.icon:SetPoint("TOPLEFT", frame, "TOPLEFT", 4, -4)
 frame.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
 
 -- border sits on a lower layer and extends past the icon, so only its
@@ -284,7 +306,7 @@ frame.burst.icon:SetAllPoints()
 frame.burst.icon:SetTexCoord(0.07, 0.93, 0.07, 0.93)
 frame.burst.label = frame.burst:CreateFontString(nil, "OVERLAY")
 frame.burst.label:SetFont(STANDARD_TEXT_FONT, 10, "OUTLINE")
-frame.burst.label:SetPoint("BOTTOM", frame.burst, "TOP", 0, 2)
+frame.burst.label:SetPoint("BOTTOM", frame.burst, "BOTTOM", 0, 2)
 frame.burst.label:SetText("USE!")
 frame.burst.label:SetTextColor(1, 0.6, 0)
 frame.burst.pulse = frame.burst:CreateAnimationGroup()
@@ -295,13 +317,17 @@ burstAnim:SetDuration(0.4)
 frame.burst.pulse:SetLooping("BOUNCE")
 frame.burst:Hide()
 
+-- Estimated time until out of mana, shown under the debuff row in combat
+frame.oomText = frame:CreateFontString(nil, "OVERLAY")
+frame.oomText:SetFont(STANDARD_TEXT_FONT, 10, "OUTLINE")
+frame.oomText:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 4, 4)
+frame.oomText:Hide()
+
 -- Debuff tracker row: SW:P, VT, VE
 local dotFrames = {}
 for i, key in ipairs(dotKeys) do
     local dot = CreateFrame("Frame", nil, frame)
     dot:SetSize(DOT_SIZE, DOT_SIZE)
-    dot:SetPoint("TOPLEFT", frame, "TOPLEFT",
-        4 + (i - 1) * (DOT_SIZE + DOT_SPACING), -(4 + ICON_SIZE + 4))
 
     dot.icon = dot:CreateTexture(nil, "ARTWORK")
     dot.icon:SetAllPoints()
@@ -320,10 +346,36 @@ for i, key in ipairs(dotKeys) do
     dot.textFrame:SetFrameLevel(dot.cd:GetFrameLevel() + 1)
     dot.text = dot.textFrame:CreateFontString(nil, "OVERLAY")
     dot.text:SetFont(STANDARD_TEXT_FONT, 11, "OUTLINE")
-    dot.text:SetPoint("CENTER", dot, "BOTTOM", 0, 1)
+    dot.text:SetPoint("CENTER", dot, "CENTER", 0, 0)
 
     dot.key = key
     dotFrames[i] = dot
+end
+
+-- A tracker slot is shown only for spells this character knows (racials
+-- resolve per-race) and hasn't toggled off.
+local function DotVisible(key)
+    if not IsKnown(key) then return false end
+    if key == "ve" and not db.useVE then return false end
+    if (key == "dp" or key == "starshards") and not db.useRacial then return false end
+    return true
+end
+
+-- Anchor the visible tracker slots side by side and fit the frame width
+-- to however many this character actually has (3 base + 1 racial).
+local function LayoutDots()
+    if not db then return end
+    local shown = 0
+    for _, dot in ipairs(dotFrames) do
+        if DotVisible(dot.key) then
+            dot:ClearAllPoints()
+            dot:SetPoint("TOPLEFT", frame, "TOPLEFT",
+                4 + shown * (DOT_SIZE + DOT_SPACING), -(4 + ICON_SIZE + 4))
+            shown = shown + 1
+        end
+    end
+    local rowWidth = math.max(shown * DOT_SIZE + math.max(shown - 1, 0) * DOT_SPACING, ICON_SIZE)
+    frame:SetWidth(rowWidth + 8)
 end
 
 --------------------------------------------------------------------------
@@ -336,6 +388,30 @@ local function ManaPct()
     return UnitPower("player", 0) / max * 100
 end
 
+-- Time-until-OOM: projected from the average net drain since combat
+-- started (mana anchored on PLAYER_REGEN_DISABLED). A whole-fight average
+-- bakes in spell costs, Spirit Tap, VT returns, fiend, and mp5, and it is
+-- stable — a short sliding window swings wildly as bursty casts enter and
+-- leave it. Converges as the fight goes on.
+local oomStartTime, oomStartMana = 0, 0
+
+local function OOMReset()
+    oomStartTime = GetTime()
+    oomStartMana = UnitPower("player", 0)
+end
+
+-- Seconds until OOM at the fight-average drain rate, or nil early in the
+-- fight or while mana is flat/climbing.
+local function TimeToOOM()
+    if oomStartTime == 0 then return nil end
+    local elapsed = GetTime() - oomStartTime
+    if elapsed < 8 then return nil end
+    local mana = UnitPower("player", 0)
+    local rate = (oomStartMana - mana) / elapsed
+    if rate < 1 then return nil end
+    return mana / rate
+end
+
 -- Shadow Word: Death backlash safety. Estimates the worst case the spell
 -- could hit us for — max base damage of the known rank plus shadow spell
 -- power (0.429 coefficient), amplified ~1.6x for talents/target debuffs
@@ -346,6 +422,10 @@ local SWD_COEFF = 0.429
 local SWD_AMP = 1.6
 local SWD_CRIT = 1.5
 local SWD_MARGIN = 1.1
+
+-- Devouring Plague is a DPS gain but very mana-hungry: only suggest it
+-- while mana is comfortably above this percentage.
+local DP_MANA_PCT = 60
 
 local function SWDMaxBase()
     if IsPlayerSpell then
@@ -361,12 +441,66 @@ local function SWDSafe()
     return UnitHealth("player") > worstBacklash * SWD_MARGIN
 end
 
+-- Target time-to-die: same ring-buffer approach as the OOM estimator,
+-- pointed at the target's health. The buffer resets whenever the target
+-- GUID changes, so each mob gets its own estimate.
+local TTD_WINDOW = 10
+local TTD_SAMPLE_EVERY = 0.5
+local TTD_SLOTS = math.floor(TTD_WINDOW / TTD_SAMPLE_EVERY) + 1
+local ttdTimes, ttdHealths = {}, {}
+local ttdIndex, ttdLastSample = 0, 0
+local ttdGUID
+
+local function TTDReset()
+    for i = 1, TTD_SLOTS do
+        ttdTimes[i] = nil
+        ttdHealths[i] = nil
+    end
+    ttdLastSample = 0
+end
+
+local function TTDSample()
+    local guid = UnitGUID("target")
+    if guid ~= ttdGUID then
+        ttdGUID = guid
+        TTDReset()
+    end
+    if not guid then return end
+    local now = GetTime()
+    if now - ttdLastSample < TTD_SAMPLE_EVERY then return end
+    ttdLastSample = now
+    ttdIndex = (ttdIndex % TTD_SLOTS) + 1
+    ttdTimes[ttdIndex] = now
+    ttdHealths[ttdIndex] = UnitHealth("target")
+end
+
+-- Seconds until the target dies at the current damage rate, or nil when
+-- there's too little data or its health isn't dropping.
+local function TimeToDie()
+    local now = GetTime()
+    local oldestT, oldestH
+    for i = 1, TTD_SLOTS do
+        local t = ttdTimes[i]
+        if t and now - t <= TTD_WINDOW and (not oldestT or t < oldestT) then
+            oldestT, oldestH = t, ttdHealths[i]
+        end
+    end
+    if not oldestT or now - oldestT < 3 then return nil end
+    local hp = UnitHealth("target")
+    local rate = (oldestH - hp) / (now - oldestT)
+    if rate <= 0 then return nil end
+    return hp / rate
+end
+
 -- Decide the next spell. `castingKey` is the spell currently being cast
 -- (assumed to land, so it's skipped), and `lead` is the time until that
 -- cast finishes — cooldowns/DoTs are evaluated as of that moment, so the
 -- suggestion is what to press NEXT, not what's happening now.
 local function NextSpell(castingKey, lead)
     lead = lead or 0
+    -- DoTs are gated on the target living long enough to pay for their
+    -- GCD; no estimate (nil) means no gating
+    local ttd = TimeToDie()
 
     if IsKnown("shadowform") and not RecentlyCast("shadowform", true)
         and not hasShadowform then
@@ -375,21 +509,23 @@ local function NextSpell(castingKey, lead)
 
     -- Vampiric Touch: refresh when remaining time won't outlast its cast,
     -- using the live haste-adjusted cast time.
-    if IsKnown("vt") and castingKey ~= "vt" and not RecentlyCast("vt") then
+    if IsKnown("vt") and castingKey ~= "vt" and not RecentlyCast("vt")
+        and (not ttd or ttd > 8) then
         local remaining = MyDebuffRemaining(spellName.vt)
-        if not remaining or remaining < lead + CastTime("vt") then
+        if not remaining or remaining < lead + CastTime("vt") + Latency() then
             return "vt"
         end
     end
 
-    if IsKnown("swp") and not RecentlyCast("swp") then
+    if IsKnown("swp") and not RecentlyCast("swp") and (not ttd or ttd > 6) then
         local remaining = MyDebuffRemaining(spellName.swp)
-        if not remaining or remaining <= lead then
+        if not remaining or remaining <= lead + Latency() then
             return "swp"
         end
     end
 
     if db.useVE and IsKnown("ve") and not RecentlyCast("ve")
+        and (not ttd or ttd > 10)
         and not MyDebuffRemaining(spellName.ve) then
         return "ve"
     end
@@ -401,6 +537,24 @@ local function NextSpell(castingKey, lead)
 
     if db.useSWD and IsKnown("swd") and CooldownRemaining("swd") <= lead + 0.3 then
         return "swd"
+    end
+
+    -- Racial DoTs: instants, so one GCD buys a long DoT — worth casting
+    -- above Mind Flay per standard TBC priority. Devouring Plague's huge
+    -- mana cost makes it the first cut when mana runs thin, hence the gate.
+    if db.useRacial and IsKnown("dp") and not RecentlyCast("dp")
+        and ManaPct() >= DP_MANA_PCT
+        and (not ttd or ttd > 12)
+        and CooldownRemaining("dp") <= lead + 0.3
+        and not MyDebuffRemaining(spellName.dp) then
+        return "dp"
+    end
+
+    if db.useRacial and IsKnown("starshards") and not RecentlyCast("starshards")
+        and (not ttd or ttd > 8)
+        and CooldownRemaining("starshards") <= lead + 0.3
+        and not MyDebuffRemaining(spellName.starshards) then
+        return "starshards"
     end
 
     if db.useFiend and IsKnown("shadowfiend")
@@ -450,6 +604,127 @@ local function ShouldClip(key)
 end
 
 --------------------------------------------------------------------------
+-- Fight report
+--------------------------------------------------------------------------
+-- Combat-log tracking runs only while in combat (the event is registered
+-- on PLAYER_REGEN_DISABLED and dropped on PLAYER_REGEN_ENABLED). After
+-- fights of REPORT_MIN_SECONDS or longer, a one-line summary is printed:
+-- DoT uptime, mana returned to the group via VT, VE healing, cast counts.
+
+local REPORT_MIN_SECONDS = 30
+
+local playerGUID
+
+local dotBySpellName = {}
+if spellName.swp then dotBySpellName[spellName.swp] = "swp" end
+if spellName.vt then dotBySpellName[spellName.vt] = "vt" end
+
+local report = {
+    active = false,
+    start = 0,
+    vtMana = 0,
+    veHeal = 0,
+    mb = 0,
+    swd = 0,
+    dots = {
+        swp = { guids = {}, n = 0, since = 0, total = 0 },
+        vt  = { guids = {}, n = 0, since = 0, total = 0 },
+    },
+}
+
+local function StartReport()
+    report.active = true
+    report.start = GetTime()
+    report.vtMana, report.veHeal, report.mb, report.swd = 0, 0, 0, 0
+    for _, d in pairs(report.dots) do
+        wipe(d.guids)
+        d.n, d.since, d.total = 0, 0, 0
+    end
+end
+
+-- Uptime is "time at least one mob carries my DoT": a per-GUID set with a
+-- running counter, accumulating whenever the counter is above zero.
+local function DotApplied(d, guid, now)
+    if not d.guids[guid] then
+        d.guids[guid] = true
+        d.n = d.n + 1
+        if d.n == 1 then d.since = now end
+    end
+end
+
+local function DotRemoved(d, guid, now)
+    if d.guids[guid] then
+        d.guids[guid] = nil
+        d.n = d.n - 1
+        if d.n == 0 then d.total = d.total + (now - d.since) end
+    end
+end
+
+local function HandleCombatLog(_, subevent, _, sourceGUID, _, _, _, destGUID, _, _, _, _, spellN, _, amount)
+    if not report.active then return end
+    local now = GetTime()
+    if subevent == "UNIT_DIED" then
+        DotRemoved(report.dots.swp, destGUID, now)
+        DotRemoved(report.dots.vt, destGUID, now)
+        return
+    end
+    if sourceGUID ~= playerGUID then return end
+    if subevent == "SPELL_AURA_APPLIED" or subevent == "SPELL_AURA_REFRESH" then
+        local key = dotBySpellName[spellN]
+        if key then DotApplied(report.dots[key], destGUID, now) end
+    elseif subevent == "SPELL_AURA_REMOVED" then
+        local key = dotBySpellName[spellN]
+        if key then DotRemoved(report.dots[key], destGUID, now) end
+    elseif subevent == "SPELL_ENERGIZE" then
+        if spellN == spellName.vt and amount then
+            report.vtMana = report.vtMana + amount
+        end
+    elseif subevent == "SPELL_PERIODIC_HEAL" or subevent == "SPELL_HEAL" then
+        if spellN == spellName.ve and amount then
+            report.veHeal = report.veHeal + amount
+        end
+    end
+end
+
+local function FinishReport()
+    if not report.active then return end
+    report.active = false
+    local now = GetTime()
+    local dur = now - report.start
+    for _, d in pairs(report.dots) do
+        if d.n > 0 then
+            d.total = d.total + (now - d.since)
+            d.n = 0
+            wipe(d.guids)
+        end
+    end
+    if not db or not db.useReport or dur < REPORT_MIN_SECONDS then return end
+    if report.mb == 0 and report.swd == 0
+        and report.dots.swp.total == 0 and report.dots.vt.total == 0 then
+        return
+    end
+    local parts = {}
+    parts[#parts + 1] = string.format("fight %d:%02d", math.floor(dur / 60), math.floor(dur % 60))
+    if IsKnown("swp") then
+        parts[#parts + 1] = string.format("SW:P %d%%", report.dots.swp.total / dur * 100)
+    end
+    if IsKnown("vt") then
+        parts[#parts + 1] = string.format("VT %d%%", report.dots.vt.total / dur * 100)
+    end
+    if report.vtMana > 0 then
+        parts[#parts + 1] = string.format("VT mana to group %d", report.vtMana)
+    end
+    if report.veHeal > 0 then
+        parts[#parts + 1] = string.format("VE healing %d", report.veHeal)
+    end
+    parts[#parts + 1] = string.format("MB %d", report.mb)
+    if IsKnown("swd") then
+        parts[#parts + 1] = string.format("SW:D %d", report.swd)
+    end
+    Print(table.concat(parts, " | "))
+end
+
+--------------------------------------------------------------------------
 -- Display update
 --------------------------------------------------------------------------
 
@@ -471,9 +746,7 @@ end
 
 local function UpdateDots()
     for _, dot in ipairs(dotFrames) do
-        local known = IsKnown(dot.key)
-        if dot.key == "ve" and not db.useVE then known = false end
-        if not known then
+        if not DotVisible(dot.key) then
             dot:Hide()
         else
             dot:Show()
@@ -528,6 +801,7 @@ local function UpdateDisplay()
     end
 
     ScanAuras()
+    TTDSample()
 
     local valid = HasValidTarget()
     local key, clipKey
@@ -568,6 +842,18 @@ local function UpdateDisplay()
     end
 
     local burstIcon = BurstSuggestion()
+    -- Inner Focus pairing: its +25% crit is wasted on DoTs (they can't
+    -- crit in TBC) but the free cast is worth the most on the priciest
+    -- DoT — so alert when IF is ready and the suggestion is DP or SW:P.
+    if not burstIcon and db.useFocus and IsKnown("innerfocus")
+        and not hasInnerFocus and not RecentlyCast("innerfocus", true)
+        and CooldownRemaining("innerfocus") <= 0
+        -- on Undead, hold IF for the pricier Devouring Plague unless DP
+        -- is still a ways out
+        and (key == "dp" or (key == "swp"
+            and (not IsKnown("dp") or CooldownRemaining("dp") > 30))) then
+        burstIcon = spellIcon.innerfocus
+    end
     local burstPreview = false
     if not burstIcon and not db.locked then
         -- unlocked placement preview: static and faded, never pulsing
@@ -586,6 +872,36 @@ local function UpdateDisplay()
     else
         frame.burst.pulse:Stop()
         frame.burst:Hide()
+    end
+
+    -- bottom line: target time-to-die and time-until-OOM, colored per part
+    local ttdStr
+    if db.useTTD and valid then
+        local ttd = TimeToDie()
+        if ttd and ttd < 600 then
+            local c = ttd < 8 and "|cffff3333" or (ttd < 20 and "|cffffd633" or "|cffe6e6e6")
+            ttdStr = c .. "TTD " .. FormatTime(ttd) .. "|r"
+        end
+    end
+    local oomStr
+    if db.useOOM and UnitAffectingCombat("player") then
+        local ttoom = TimeToOOM()
+        if ttoom and ttoom < 600 then
+            local c = ttoom < 10 and "|cffff3333" or (ttoom < 30 and "|cffffd633" or "|cffe6e6e6")
+            oomStr = string.format("%sOOM %d:%02d|r", c, math.floor(ttoom / 60), math.floor(ttoom % 60))
+        end
+    end
+    if ttdStr or oomStr then
+        frame.oomText:SetText(ttdStr and oomStr and (ttdStr .. "  " .. oomStr) or ttdStr or oomStr)
+        frame.oomText:SetAlpha(1)
+        frame.oomText:Show()
+    elseif not db.locked then
+        -- unlocked placement preview
+        frame.oomText:SetText("|cffe6e6e6TTD 14  OOM 1:42|r")
+        frame.oomText:SetAlpha(0.45)
+        frame.oomText:Show()
+    else
+        frame.oomText:Hide()
     end
 
     UpdateDots()
@@ -611,6 +927,8 @@ end)
 local events = CreateFrame("Frame")
 events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_TARGET_CHANGED")
+events:RegisterEvent("PLAYER_REGEN_DISABLED")
+events:RegisterEvent("PLAYER_REGEN_ENABLED")
 events:RegisterEvent("SPELLS_CHANGED")
 events:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
 events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
@@ -618,6 +936,8 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
         if arg1 ~= ADDON_NAME then return end
         LoadDB()
         RefreshKnown()
+        LayoutDots()
+        playerGUID = UnitGUID("player")
         frame:ClearAllPoints()
         frame:SetPoint(db.point[1], UIParent, db.point[4] or db.point[1], db.point[2], db.point[3])
         frame:SetScale(db.scale)
@@ -626,8 +946,20 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
         UpdateDisplay()
     elseif event == "PLAYER_TARGET_CHANGED" then
         UpdateDisplay()
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        -- combat just started: drop idle-time samples so the drain rate
+        -- reflects the fight, not the pre-pull standing around
+        OOMReset()
+        StartReport()
+        events:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        events:UnregisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+        FinishReport()
+    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
+        HandleCombatLog(CombatLogGetCurrentEventInfo())
     elseif event == "SPELLS_CHANGED" then
         RefreshKnown()
+        LayoutDots()
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         -- arg3 is the rank-specific spell id; match by name
         local name = GetSpellInfo(arg3)
@@ -636,6 +968,13 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
                 if sName == name then
                     justCast[key] = GetTime()
                     justCastGUID[key] = UnitGUID("target")
+                    if report.active then
+                        if key == "mindblast" then
+                            report.mb = report.mb + 1
+                        elseif key == "swd" then
+                            report.swd = report.swd + 1
+                        end
+                    end
                     break
                 end
             end
@@ -646,10 +985,6 @@ end)
 --------------------------------------------------------------------------
 -- Slash commands
 --------------------------------------------------------------------------
-
-local function Print(msg)
-    DEFAULT_CHAT_FRAME:AddMessage("|cff9482c9NextCast:|r " .. msg)
-end
 
 SLASH_NEXTCAST1 = "/nextcast"
 SLASH_NEXTCAST2 = "/nc"
@@ -691,7 +1026,21 @@ SlashCmdList.NEXTCAST = function(input)
         Print("Shadow Word: Death suggestions " .. (db.useSWD and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
     elseif cmd == "ve" then
         db.useVE = not db.useVE
+        LayoutDots()
         Print("Vampiric Embrace suggestions " .. (db.useVE and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
+    elseif cmd == "racial" then
+        db.useRacial = not db.useRacial
+        LayoutDots()
+        Print("Racial DoT suggestions (Devouring Plague/Starshards) " .. (db.useRacial and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
+    elseif cmd == "focus" then
+        db.useFocus = not db.useFocus
+        Print("Inner Focus pairing alerts " .. (db.useFocus and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
+    elseif cmd == "ttd" then
+        db.useTTD = not db.useTTD
+        Print("Time-to-die display " .. (db.useTTD and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
+    elseif cmd == "report" then
+        db.useReport = not db.useReport
+        Print("Post-fight reports " .. (db.useReport and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
     elseif cmd == "fiend" then
         db.useFiend = not db.useFiend
         Print("Shadowfiend suggestions " .. (db.useFiend and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
@@ -701,6 +1050,9 @@ SlashCmdList.NEXTCAST = function(input)
     elseif cmd == "clip" then
         db.useClip = not db.useClip
         Print("Mind Flay clip indicator " .. (db.useClip and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
+    elseif cmd == "oom" then
+        db.useOOM = not db.useOOM
+        Print("Time-until-OOM display " .. (db.useOOM and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
     else
         Print("Commands:")
         Print("  /nc unlock — move the box (then /nc lock)")
@@ -710,6 +1062,11 @@ SlashCmdList.NEXTCAST = function(input)
         Print("  /nc swd | ve | fiend — toggle those suggestions")
         Print("  /nc lust — toggle potion/trinket alerts during Lust/Heroism")
         Print("  /nc clip — toggle the Mind Flay clip indicator")
+        Print("  /nc oom — toggle the time-until-OOM display")
+        Print("  /nc racial — toggle racial DoT suggestions (DP/Starshards)")
+        Print("  /nc focus — toggle Inner Focus pairing alerts")
+        Print("  /nc ttd — toggle the target time-to-die display")
+        Print("  /nc report — toggle post-fight reports")
     end
     UpdateDisplay()
 end

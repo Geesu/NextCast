@@ -17,6 +17,7 @@ zip -rq "$OUT" "$FOLDER" \
     -x "$FOLDER/assets/*" \
     -x "$FOLDER/build.sh" \
     -x "$FOLDER/CURSEFORGE.md" \
+    -x "$FOLDER/CLAUDE.md" \
     -x "$FOLDER/.git/*" \
     -x "$FOLDER/.gitignore" \
     -x "*.DS_Store"
