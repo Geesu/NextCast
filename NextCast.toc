@@ -1,8 +1,8 @@
 ## Interface: 20506, 20505
 ## Title: NextCast
-## Notes: Suggests your next cast (Shadow Priest) and tracks your debuffs on the target.
+## Notes: Suggests your next cast (Shadow Priest, Balance Druid) and tracks your debuffs on the target.
 ## Author: beckerbi
-## Version: 1.0.1
+## Version: 1.0.2
 ## IconTexture: Interface\Icons\Spell_Shadow_Shadowform
 ## X-License: MIT
 ## SavedVariables: NextCastDB

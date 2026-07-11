@@ -1,6 +1,6 @@
 # NextCast
 
-A tiny, movable "what do I cast next?" box for **Shadow Priests** on TBC Classic (Anniversary).
+A tiny, movable "what do I cast next?" box for **Shadow Priests** and **Balance Druids** on TBC Classic (Anniversary).
 
 ![Interface: 2.5.6](https://img.shields.io/badge/TBC-2.5.6-purple)
 
@@ -17,17 +17,26 @@ A tiny, movable "what do I cast next?" box for **Shadow Priests** on TBC Classic
 
 - **Next-cast icon** — one icon showing the spell you should press next, following the
   standard TBC shadow priority: Shadowform → Vampiric Touch → Shadow Word: Pain →
-  Vampiric Embrace → Mind Blast → Shadow Word: Death → racial DoT → Shadowfiend
-  (low mana) → Mind Flay.
+  Vampiric Embrace (bosses only, opt-in via `/nc ve`) → Mind Blast → Shadow Word: Death →
+  racial DoT → Shadowfiend (bosses, mana below 20%) → Mind Flay.
+  On a Balance Druid: Moonkin Form → Faerie Fire (anyone's counts) → Moonfire (while
+  mana is healthy) → Insect Swarm (only with 4pc Tier 5, auto-detected — per sims IS
+  is otherwise a loss vs more Starfire) → Innervate (bosses, mana below 20%) → Starfire.
 - **Racial DoTs** — Devouring Plague (Undead) and Starshards (Night Elf) are woven in
-  above Mind Flay, per standard priority. DP is only suggested while your mana is
-  healthy (≥60%) — it's a DPS gain with a huge mana cost, so it's the first cut when
-  you're running dry. Both get tracker slots automatically on races that have them.
+  above Mind Flay, per standard priority. DP is only suggested on bosses and while your
+  mana is healthy (≥60%) — it's a DPS gain with a huge mana cost and a 3-minute
+  cooldown you don't want to burn on trash right before a pull. Both get tracker slots
+  automatically on races that have them.
+- **Learned mob lifetimes** — every kill teaches NextCast how long that mob type lives
+  (kept per instance difficulty). The DoT gates use it from the very first GCD of a
+  pull — before the live time-to-die estimate has data — so dots aren't suggested on
+  trash that historically dies before they pay off.
 - **Predictive** — reads your cast bar and evaluates cooldowns and DoT timers *as of the
   moment your current cast finishes*, so mid-cast it already shows your next press.
   DoT refreshes are timed so the new application lands right after the old one's final
   tick (haste-aware, so the window tightens under Bloodlust).
-- **DoT tracker** — your SW:P / VT / VE on the target, with cooldown-sweep overlays and
+- **DoT tracker** — your DoTs on the target (SW:P/VT/VE on a priest, FF/MF on a druid,
+  IS with 4pc T5), with cooldown-sweep overlays and
   remaining time (red under 3 seconds).
 - **Mind Flay clip signal** — once your 2nd flay tick has fired and something better is
   ready, the border turns red with a "CLIP" label: cut the channel now.
@@ -50,9 +59,10 @@ A tiny, movable "what do I cast next?" box for **Shadow Priests** on TBC Classic
   DP ~12s), so on dying trash the addon steers you to direct damage instead.
 - **Latency-aware timing** — DoT refresh windows include your live world latency, so
   recasts land on time at real ping.
-- **Post-fight report** — after fights of 30+ seconds, a one-line chat summary: SW:P
-  and VT uptime %, mana returned to your group via Vampiric Touch, Vampiric Embrace
-  healing, and Mind Blast / SW:D cast counts.
+- **Post-fight report** — after fights of 30+ seconds, a one-line chat summary. Priests:
+  SW:P and VT uptime %, mana returned to your group via Vampiric Touch, Vampiric
+  Embrace healing, and Mind Blast / SW:D cast counts. Druids: IS/MF uptime and
+  Starfire / Wrath cast counts.
 - Only suggests spells you actually know, so it works while leveling too.
 
 This is a **suggestion display only** — it never casts anything for you, which keeps it
@@ -64,13 +74,13 @@ fully within Blizzard's addon policy.
 
 | Command | Effect |
 |---|---|
-| `/nc unlock` / `/nc lock` | Unlock to drag the box, lock it in place |
+| `/nc unlock` / `/nc lock` | Unlock to drag the box, lock it in place (starts unlocked — lock it once positioned so it doesn't catch clicks) |
 | `/nc hide` / `/nc show` | Hide or show the box entirely |
 | `/nc reset` | Reset position |
 | `/nc scale <0.5–3>` | Resize |
 | `/nc swd` | Toggle Shadow Word: Death suggestions |
-| `/nc ve` | Toggle Vampiric Embrace suggestions |
-| `/nc fiend` | Toggle Shadowfiend (low-mana) suggestions |
+| `/nc ve` | Add Vampiric Embrace to the boss rotation (off by default) |
+| `/nc mana` | Toggle the low-mana cooldown suggestion — Shadowfiend/Innervate (bosses, low mana) |
 | `/nc lust` | Toggle potion/trinket alerts during Lust/Heroism |
 | `/nc clip` | Toggle the Mind Flay clip indicator |
 | `/nc oom` | Toggle the time-until-OOM display |
@@ -88,4 +98,5 @@ Copy the `NextCast` folder into
 
 - The burst alert suggests **any** equipped on-use trinket — including a PvP Medallion.
 - Only Bloodlust/Heroism trigger the burst alert (not Drums of Battle or Power Infusion).
-- Shadow Priest only, for now.
+- Shadow Priest and Balance Druid only, for now. On a druid the box appears once
+  Moonkin Form is known, so resto/feral specs aren't bothered.

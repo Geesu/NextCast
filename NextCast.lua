@@ -1,30 +1,44 @@
--- NextCast: shows the next spell a TBC Shadow Priest should cast on the
--- current target, plus your damage-over-time debuffs on the target with
--- their remaining duration.
+-- NextCast: shows the next spell a TBC Shadow Priest or Balance Druid
+-- should cast on the current target, plus your damage-over-time debuffs
+-- on the target with their remaining duration.
 
 local ADDON_NAME = ...
 
 local _, playerClass = UnitClass("player")
-if playerClass ~= "PRIEST" then return end
+if playerClass ~= "PRIEST" and playerClass ~= "DRUID" then return end
+local IS_PRIEST = playerClass == "PRIEST"
 
 --------------------------------------------------------------------------
 -- Spell data (rank-1 spell IDs; names resolved via GetSpellInfo so the
 -- addon works in any locale and with any rank the player knows)
 --------------------------------------------------------------------------
 
-local SPELLS = {
-    shadowform  = 15473,
-    swp         = 589,   -- Shadow Word: Pain
-    vt          = 34914, -- Vampiric Touch
-    ve          = 15286, -- Vampiric Embrace
-    mindblast   = 8092,
-    swd         = 32379, -- Shadow Word: Death
-    mindflay    = 15407,
-    shadowfiend = 34433,
-    dp          = 2944,  -- Devouring Plague (Undead racial)
-    starshards  = 10797, -- Starshards (Night Elf racial)
-    innerfocus  = 14751, -- Inner Focus (Discipline talent)
-}
+local SPELLS
+if IS_PRIEST then
+    SPELLS = {
+        shadowform  = 15473,
+        swp         = 589,   -- Shadow Word: Pain
+        vt          = 34914, -- Vampiric Touch
+        ve          = 15286, -- Vampiric Embrace
+        mindblast   = 8092,
+        swd         = 32379, -- Shadow Word: Death
+        mindflay    = 15407,
+        shadowfiend = 34433,
+        dp          = 2944,  -- Devouring Plague (Undead racial)
+        starshards  = 10797, -- Starshards (Night Elf racial)
+        innerfocus  = 14751, -- Inner Focus (Discipline talent)
+    }
+else
+    SPELLS = {
+        moonkin   = 24858, -- Moonkin Form
+        ff        = 770,   -- Faerie Fire
+        is        = 5570,  -- Insect Swarm
+        moonfire  = 8921,
+        starfire  = 2912,
+        wrath     = 5176,
+        innervate = 29166,
+    }
+end
 
 local spellName, spellIcon = {}, {}
 for key, id in pairs(SPELLS) do
@@ -32,6 +46,11 @@ for key, id in pairs(SPELLS) do
     spellName[key] = name
     spellIcon[key] = icon
 end
+
+-- "Faerie Fire (Feral)" is a differently-named, mutually-exclusive twin
+-- of Faerie Fire: a feral's application blocks ours, so it must count
+-- as FF coverage or the FF suggestion locks onto a cast that can't land.
+local ffFeralName = not IS_PRIEST and GetSpellInfo(16857) or nil
 
 -- Spellbook knowledge, cached and refreshed on SPELLS_CHANGED rather than
 -- re-queried every display update.
@@ -46,6 +65,37 @@ RefreshKnown()
 
 local function IsKnown(key)
     return known[key]
+end
+
+-- Balance T5, Nordrassil Regalia: the 4-piece makes Starfire hit 10%
+-- harder while your Moonfire or Insect Swarm ticks on the target. Per
+-- sims that set bonus is the only case where weaving Insect Swarm beats
+-- casting more Starfire, so the IS suggestion is gated on wearing it.
+local T5_ITEMS = {
+    [30231] = true, -- Nordrassil Chestpiece
+    [30232] = true, -- Nordrassil Gauntlets
+    [30233] = true, -- Nordrassil Headpiece
+    [30234] = true, -- Nordrassil Wrath-Kilt
+    [30235] = true, -- Nordrassil Wrath-Mantle
+}
+local hasT5 = false
+
+local function RefreshT5()
+    if IS_PRIEST then return end
+    local pieces = 0
+    for slot = 1, 17 do
+        local id = GetInventoryItemID("player", slot)
+        if id and T5_ITEMS[id] then pieces = pieces + 1 end
+    end
+    hasT5 = pieces >= 4
+end
+
+-- On druids the box is Balance-only: the rotation's spells are baseline
+-- for every druid, so without this gate a resto or feral druid would
+-- get DPS suggestions mid-heal. Moonkin Form — the 31-point talent — is
+-- the "actually a boomkin" signal.
+local function SpecActive()
+    return IS_PRIEST or IsKnown("moonkin")
 end
 
 local GCD = 1.5
@@ -148,7 +198,9 @@ end
 -- exactly once; everything else reads from these caches. No tables are
 -- allocated per update.
 
-local dotKeys = { "swp", "vt", "ve", "dp", "starshards" }
+local dotKeys = IS_PRIEST
+    and { "swp", "vt", "ve", "dp", "starshards" }
+    or { "ff", "is", "moonfire" }
 
 local trackedDebuffs = {}
 for _, key in ipairs(dotKeys) do
@@ -156,7 +208,7 @@ for _, key in ipairs(dotKeys) do
 end
 
 local debuffExpiry, debuffDuration = {}, {}
-local hasShadowform, hasLust, hasInnerFocus = false, false, false
+local hasForm, hasLust, hasInnerFocus, hasInnervate = false, false, false, false
 
 local function ScanAuras()
     for name in pairs(debuffExpiry) do
@@ -171,12 +223,29 @@ local function ScanAuras()
             debuffDuration[dName] = duration or 0
         end
     end
-    hasShadowform, hasLust, hasInnerFocus = false, false, false
+    -- Faerie Fire doesn't stack, so anyone's counts — pick it up without
+    -- the PLAYER filter (overwriting the filtered result is harmless:
+    -- there is only ever one instance on the target). The feral variant
+    -- blocks ours entirely, so it counts as coverage too, recorded under
+    -- the regular FF name so the rotation and tracker both see it.
+    if spellName.ff then
+        for i = 1, 40 do
+            local dName, _, _, _, duration, expirationTime = UnitDebuff("target", i)
+            if not dName then break end
+            if dName == spellName.ff or dName == ffFeralName then
+                debuffExpiry[spellName.ff] = expirationTime or 0
+                debuffDuration[spellName.ff] = duration or 0
+                break
+            end
+        end
+    end
+    hasForm, hasLust, hasInnerFocus, hasInnervate = false, false, false, false
     for i = 1, 40 do
         local bName = UnitBuff("player", i)
         if not bName then break end
-        if bName == spellName.shadowform then hasShadowform = true end
+        if bName == spellName.shadowform or bName == spellName.moonkin then hasForm = true end
         if bName == spellName.innerfocus then hasInnerFocus = true end
+        if bName == spellName.innervate then hasInnervate = true end
         if lustNames[bName] then hasLust = true end
     end
 end
@@ -196,11 +265,11 @@ end
 --------------------------------------------------------------------------
 
 local defaults = {
-    locked = true,
+    locked = false,
     hidden = false,
     scale = 1,
     useSWD = true,
-    useVE = true,
+    useVE = false,
     useFiend = true,
     useLust = true,
     useClip = true,
@@ -209,7 +278,6 @@ local defaults = {
     useFocus = true,
     useTTD = true,
     useReport = true,
-    fiendManaPct = 50,
     point = { "CENTER", 0, -120 },
 }
 
@@ -227,6 +295,9 @@ local function LoadDB()
             end
         end
     end
+    -- learned mob lifetimes, keyed "npcID-difficulty" (open-ended, so
+    -- not part of the fixed defaults above)
+    db.mobLife = db.mobLife or {}
 end
 
 --------------------------------------------------------------------------
@@ -358,6 +429,7 @@ local function DotVisible(key)
     if not IsKnown(key) then return false end
     if key == "ve" and not db.useVE then return false end
     if (key == "dp" or key == "starshards") and not db.useRacial then return false end
+    if key == "is" and not hasT5 then return false end
     return true
 end
 
@@ -427,6 +499,14 @@ local SWD_MARGIN = 1.1
 -- while mana is comfortably above this percentage.
 local DP_MANA_PCT = 60
 
+-- Shadowfiend/Innervate is the emergency mana button: hold it until mana
+-- is actually low so its return isn't wasted on a near-full bar.
+local FIEND_MANA_PCT = 20
+
+-- Moonfire has Devouring Plague's problem in miniature: real DPS, ugly
+-- mana efficiency — only suggest it while mana is comfortable.
+local MF_MANA_PCT = 60
+
 local function SWDMaxBase()
     if IsPlayerSpell then
         if IsPlayerSpell(32996) then return 664 end -- Rank 2
@@ -492,6 +572,176 @@ local function TimeToDie()
     return hp / rate
 end
 
+--------------------------------------------------------------------------
+-- Mob lifetime learning
+--------------------------------------------------------------------------
+-- The live TTD estimate needs a few seconds of health samples, so it's
+-- blind exactly when the DoT decision matters most: the opening GCDs of
+-- a trash pull. Instead, learn how long each mob type actually lives —
+-- first combat-log appearance to UNIT_DIED, averaged per npc id and
+-- instance difficulty in SavedVariables. On the next pull of that mob
+-- type, the DoT gates know from second zero whether a DoT will pay off.
+-- The live estimate still wins once it has data; this fills the cold
+-- start.
+
+local LIFE_MIN_SAMPLES = 2 -- don't trust an average of one kill
+local LIFE_EMA = 0.3       -- weight of each new kill in the running average
+local LIFE_MAX_AGE = 900   -- forget mobs with no death this long after first seen
+
+local mobFirstSeen = {} -- mob GUID -> first combat-log appearance (GetTime)
+
+-- Entries survive combat drops on purpose — wiping them at combat edges
+-- recorded phase-transition fragments as whole boss lifetimes. Evaded
+-- or abandoned mobs age out instead (spawn GUIDs are never reused).
+local function LifePrune()
+    local cutoff = GetTime() - LIFE_MAX_AGE
+    for guid, born in pairs(mobFirstSeen) do
+        if born < cutoff then
+            mobFirstSeen[guid] = nil
+        end
+    end
+end
+
+-- Hostile (or neutral) NPC — excludes players, pets, and friendly
+-- creatures like totems, so incidental damage traffic can't count them.
+local HOSTILE_NPC_MASK = COMBATLOG_OBJECT_REACTION_HOSTILE + COMBATLOG_OBJECT_REACTION_NEUTRAL
+local function IsHostileNPC(guid, flags)
+    return flags and bit.band(flags, HOSTILE_NPC_MASK) ~= 0
+        and (guid:find("Creature", 1, true) == 1 or guid:find("Vehicle", 1, true) == 1)
+end
+
+-- Lifetime records are keyed npcID-difficulty: the same npc id lives
+-- longer on heroic than on normal.
+local function NpcKey(guid)
+    if guid:find("Creature", 1, true) == 1 or guid:find("Vehicle", 1, true) == 1 then
+        local npcID = select(6, strsplit("-", guid))
+        if npcID then
+            return npcID .. "-" .. (select(3, GetInstanceInfo()) or 0)
+        end
+    end
+end
+
+local function LifeMobSeen(guid, now)
+    if not mobFirstSeen[guid] then
+        mobFirstSeen[guid] = now
+    end
+end
+
+local function LifeMobDied(guid, now)
+    local born = mobFirstSeen[guid]
+    mobFirstSeen[guid] = nil
+    if not born or not (db and db.mobLife) then return end
+    local sample = now - born
+    if sample < 1 then return end
+    local key = NpcKey(guid)
+    if not key then return end
+    local e = db.mobLife[key]
+    if not e then
+        db.mobLife[key] = { t = sample, n = 1 }
+    else
+        -- clamp each sample's influence rather than discarding outliers:
+        -- one mob that sat in crowd control can't poison the average,
+        -- but a wrong average (bad first sample, group got faster or
+        -- slower) still drifts back to reality over a few kills
+        local capped = math.min(math.max(sample, e.t / 3), e.t * 3)
+        e.t = e.t + (capped - e.t) * LIFE_EMA
+        e.n = e.n + 1
+    end
+end
+
+-- Expected seconds of life left in the current target, from its learned
+-- lifetime minus how long it has already been in the fight.
+local function LearnedTTD()
+    local guid = UnitGUID("target")
+    if not guid then return nil end
+    local key = NpcKey(guid)
+    local e = key and db.mobLife[key]
+    if not e or e.n < LIFE_MIN_SAMPLES then return nil end
+    local born = mobFirstSeen[guid]
+    local remaining = e.t - (born and (GetTime() - born) or 0)
+    -- a mob that has outlived its learned average has falsified the
+    -- prediction for this fight — no gate beats a wrong gate
+    if remaining <= 0 then return nil end
+    return remaining
+end
+
+-- Vampiric Embrace only pays off on long fights — trash dies too fast
+-- for the group healing to matter. Raid bosses show as level -1 (skull)
+-- and world bosses carry the "worldboss" classification, but TBC 5-man
+-- bosses (normal AND heroic) are plain numeric-level elites — Murmur is
+-- "72 Elite" — so inside a 5-man, treat an elite 2+ levels above the
+-- player as a boss. The rare 72-elite trash mob this also matches is an
+-- acceptable false positive; raids aren't included since their bosses
+-- are already skull and their trash shouldn't qualify.
+local function IsBossTarget()
+    local lvl = UnitLevel("target")
+    if lvl == -1 or UnitClassification("target") == "worldboss" then
+        return true
+    end
+    local _, instanceType = GetInstanceInfo()
+    return instanceType == "party"
+        and UnitClassification("target") == "elite"
+        and lvl >= UnitLevel("player") + 2
+end
+
+-- Balance Druid priority: Moonkin Form, keep Faerie Fire up, Moonfire
+-- while mana is healthy, Insect Swarm only with 4pc T5, Innervate on
+-- bosses when running dry, Starfire filler (Wrath before Starfire is
+-- trained).
+local function DruidNextSpell(castingKey, lead, ttd)
+    if IsKnown("moonkin") and not RecentlyCast("moonkin", true)
+        and not hasForm then
+        return "moonkin"
+    end
+
+    if IsKnown("ff") and not RecentlyCast("ff") and (not ttd or ttd > 5) then
+        local remaining = MyDebuffRemaining(spellName.ff)
+        if not remaining or remaining <= lead + Latency() then
+            return "ff"
+        end
+    end
+
+    if IsKnown("moonfire") and not RecentlyCast("moonfire")
+        and ManaPct() >= MF_MANA_PCT
+        and (not ttd or ttd > 6) then
+        local remaining = MyDebuffRemaining(spellName.moonfire)
+        if not remaining or remaining <= lead + Latency() then
+            return "moonfire"
+        end
+    end
+
+    -- Insect Swarm is a DPS loss next to more Starfire — Nature damage
+    -- that misses Moonfury, Curse of Shadow, and crit — except with 4pc
+    -- T5, where it cheaply keeps the +10% Starfire buff active (notably
+    -- when low mana has gated Moonfire off above).
+    if hasT5 and IsKnown("is") and not RecentlyCast("is")
+        and (not ttd or ttd > 6) then
+        local remaining = MyDebuffRemaining(spellName.is)
+        if not remaining or remaining <= lead + Latency() then
+            return "is"
+        end
+    end
+
+    -- Innervate mirrors the Shadowfiend rules (and shares its toggle):
+    -- boss fights only, held until mana is actually low.
+    if db.useFiend and IsKnown("innervate")
+        and UnitAffectingCombat("player")
+        and IsBossTarget()
+        and not hasInnervate
+        and ManaPct() <= FIEND_MANA_PCT
+        and CooldownRemaining("innervate") <= lead then
+        return "innervate"
+    end
+
+    if IsKnown("starfire") then
+        return "starfire"
+    end
+    if IsKnown("wrath") then
+        return "wrath"
+    end
+    return nil
+end
+
 -- Decide the next spell. `castingKey` is the spell currently being cast
 -- (assumed to land, so it's skipped), and `lead` is the time until that
 -- cast finishes — cooldowns/DoTs are evaluated as of that moment, so the
@@ -499,11 +749,16 @@ end
 local function NextSpell(castingKey, lead)
     lead = lead or 0
     -- DoTs are gated on the target living long enough to pay for their
-    -- GCD; no estimate (nil) means no gating
-    local ttd = TimeToDie()
+    -- GCD; no estimate (nil) means no gating. The live estimate wins
+    -- when it has data, learned mob lifetimes cover the opening seconds.
+    local ttd = TimeToDie() or LearnedTTD()
+
+    if not IS_PRIEST then
+        return DruidNextSpell(castingKey, lead, ttd)
+    end
 
     if IsKnown("shadowform") and not RecentlyCast("shadowform", true)
-        and not hasShadowform then
+        and not hasForm then
         return "shadowform"
     end
 
@@ -525,6 +780,7 @@ local function NextSpell(castingKey, lead)
     end
 
     if db.useVE and IsKnown("ve") and not RecentlyCast("ve")
+        and IsBossTarget()
         and (not ttd or ttd > 10)
         and not MyDebuffRemaining(spellName.ve) then
         return "ve"
@@ -541,8 +797,11 @@ local function NextSpell(castingKey, lead)
 
     -- Racial DoTs: instants, so one GCD buys a long DoT — worth casting
     -- above Mind Flay per standard TBC priority. Devouring Plague's huge
-    -- mana cost makes it the first cut when mana runs thin, hence the gate.
+    -- mana cost makes it the first cut when mana runs thin, hence the
+    -- mana gate; its 3-minute cooldown is too precious to burn on trash
+    -- right before a boss, hence the boss gate.
     if db.useRacial and IsKnown("dp") and not RecentlyCast("dp")
+        and IsBossTarget()
         and ManaPct() >= DP_MANA_PCT
         and (not ttd or ttd > 12)
         and CooldownRemaining("dp") <= lead + 0.3
@@ -557,9 +816,12 @@ local function NextSpell(castingKey, lead)
         return "starshards"
     end
 
+    -- Boss-only: on trash you can drink between packs, and burning the
+    -- 5-minute cooldown there risks not having it for the boss pull.
     if db.useFiend and IsKnown("shadowfiend")
         and UnitAffectingCombat("player")
-        and ManaPct() <= db.fiendManaPct
+        and IsBossTarget()
+        and ManaPct() <= FIEND_MANA_PCT
         and CooldownRemaining("shadowfiend") <= lead then
         return "shadowfiend"
     end
@@ -606,36 +868,51 @@ end
 --------------------------------------------------------------------------
 -- Fight report
 --------------------------------------------------------------------------
--- Combat-log tracking runs only while in combat (the event is registered
--- on PLAYER_REGEN_DISABLED and dropped on PLAYER_REGEN_ENABLED). After
--- fights of REPORT_MIN_SECONDS or longer, a one-line summary is printed:
--- DoT uptime, mana returned to the group via VT, VE healing, cast counts.
+-- Report tracking runs only between PLAYER_REGEN_DISABLED and _ENABLED
+-- (gated on report.active; the combat-log event itself stays registered
+-- for lifetime learning). After fights of REPORT_MIN_SECONDS or longer,
+-- a one-line summary is printed: DoT uptime, mana returned to the group
+-- via VT, VE healing, cast counts.
 
 local REPORT_MIN_SECONDS = 30
 
 local playerGUID
 
+-- What the report tracks, per class: DoT uptimes and cast counts.
+local REPORT_DOTS = IS_PRIEST and { "swp", "vt" } or { "is", "moonfire" }
+local REPORT_CASTS = IS_PRIEST and { "mindblast", "swd" } or { "starfire", "wrath" }
+local REPORT_LABELS = {
+    swp = "SW:P", vt = "VT", mindblast = "MB", swd = "SW:D",
+    is = "IS", moonfire = "MF", starfire = "SF", wrath = "Wrath",
+}
+
 local dotBySpellName = {}
-if spellName.swp then dotBySpellName[spellName.swp] = "swp" end
-if spellName.vt then dotBySpellName[spellName.vt] = "vt" end
+for _, key in ipairs(REPORT_DOTS) do
+    if spellName[key] then dotBySpellName[spellName[key]] = key end
+end
 
 local report = {
     active = false,
     start = 0,
     vtMana = 0,
     veHeal = 0,
-    mb = 0,
-    swd = 0,
-    dots = {
-        swp = { guids = {}, n = 0, since = 0, total = 0 },
-        vt  = { guids = {}, n = 0, since = 0, total = 0 },
-    },
+    casts = {},
+    dots = {},
 }
+for _, key in ipairs(REPORT_DOTS) do
+    report.dots[key] = { guids = {}, n = 0, since = 0, total = 0 }
+end
+for _, key in ipairs(REPORT_CASTS) do
+    report.casts[key] = 0
+end
 
 local function StartReport()
     report.active = true
     report.start = GetTime()
-    report.vtMana, report.veHeal, report.mb, report.swd = 0, 0, 0, 0
+    report.vtMana, report.veHeal = 0, 0
+    for key in pairs(report.casts) do
+        report.casts[key] = 0
+    end
     for _, d in pairs(report.dots) do
         wipe(d.guids)
         d.n, d.since, d.total = 0, 0, 0
@@ -660,14 +937,30 @@ local function DotRemoved(d, guid, now)
     end
 end
 
-local function HandleCombatLog(_, subevent, _, sourceGUID, _, _, _, destGUID, _, _, _, _, spellN, _, amount)
-    if not report.active then return end
+local function HandleCombatLog(_, subevent, _, sourceGUID, _, sourceFlags, _, destGUID, _, destFlags, _, _, spellN, _, amount)
     local now = GetTime()
+    -- Lifetime learning runs on every event, in combat or not, so a
+    -- mob's 'born' stamp reflects when the FIGHT started — not when we
+    -- personally entered combat after drinking through half the pull.
     if subevent == "UNIT_DIED" then
-        DotRemoved(report.dots.swp, destGUID, now)
-        DotRemoved(report.dots.vt, destGUID, now)
+        LifeMobDied(destGUID, now)
+        if report.active then
+            for _, d in pairs(report.dots) do
+                DotRemoved(d, destGUID, now)
+            end
+        end
         return
     end
+    -- Any damage traffic (either direction, landed or missed, from
+    -- anyone) stamps a hostile NPC's entry into the fight.
+    if subevent:find("_DAMAGE", 1, true) or subevent:find("_MISSED", 1, true) then
+        if IsHostileNPC(destGUID, destFlags) then
+            LifeMobSeen(destGUID, now)
+        elseif IsHostileNPC(sourceGUID, sourceFlags) then
+            LifeMobSeen(sourceGUID, now)
+        end
+    end
+    if not report.active then return end
     if sourceGUID ~= playerGUID then return end
     if subevent == "SPELL_AURA_APPLIED" or subevent == "SPELL_AURA_REFRESH" then
         local key = dotBySpellName[spellN]
@@ -699,17 +992,24 @@ local function FinishReport()
         end
     end
     if not db or not db.useReport or dur < REPORT_MIN_SECONDS then return end
-    if report.mb == 0 and report.swd == 0
-        and report.dots.swp.total == 0 and report.dots.vt.total == 0 then
-        return
+    if not SpecActive() then return end
+    local sawAction = false
+    for _, count in pairs(report.casts) do
+        if count > 0 then sawAction = true end
     end
+    for _, d in pairs(report.dots) do
+        if d.total > 0 then sawAction = true end
+    end
+    if not sawAction then return end
     local parts = {}
     parts[#parts + 1] = string.format("fight %d:%02d", math.floor(dur / 60), math.floor(dur % 60))
-    if IsKnown("swp") then
-        parts[#parts + 1] = string.format("SW:P %d%%", report.dots.swp.total / dur * 100)
-    end
-    if IsKnown("vt") then
-        parts[#parts + 1] = string.format("VT %d%%", report.dots.vt.total / dur * 100)
+    for _, key in ipairs(REPORT_DOTS) do
+        -- IS only counts as part of the rotation with 4pc T5; without
+        -- it, "IS 0%" would scold players for following the addon's
+        -- own advice not to cast it
+        if IsKnown(key) and (key ~= "is" or hasT5) then
+            parts[#parts + 1] = string.format("%s %d%%", REPORT_LABELS[key], report.dots[key].total / dur * 100)
+        end
     end
     if report.vtMana > 0 then
         parts[#parts + 1] = string.format("VT mana to group %d", report.vtMana)
@@ -717,9 +1017,10 @@ local function FinishReport()
     if report.veHeal > 0 then
         parts[#parts + 1] = string.format("VE healing %d", report.veHeal)
     end
-    parts[#parts + 1] = string.format("MB %d", report.mb)
-    if IsKnown("swd") then
-        parts[#parts + 1] = string.format("SW:D %d", report.swd)
+    for _, key in ipairs(REPORT_CASTS) do
+        if IsKnown(key) then
+            parts[#parts + 1] = string.format("%s %d", REPORT_LABELS[key], report.casts[key])
+        end
     end
     Print(table.concat(parts, " | "))
 end
@@ -787,7 +1088,7 @@ end
 
 local function UpdateDisplay()
     if not db then return end
-    if db.hidden then
+    if db.hidden or not SpecActive() then
         frame:Hide()
         return
     end
@@ -930,12 +1231,22 @@ events:RegisterEvent("PLAYER_TARGET_CHANGED")
 events:RegisterEvent("PLAYER_REGEN_DISABLED")
 events:RegisterEvent("PLAYER_REGEN_ENABLED")
 events:RegisterEvent("SPELLS_CHANGED")
+-- always on (not just in combat) so mob lifetime learning sees fights
+-- that started before the player's own combat did
+events:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
 events:RegisterUnitEvent("UNIT_SPELLCAST_SUCCEEDED", "player")
+if not IS_PRIEST then
+    events:RegisterEvent("PLAYER_EQUIPMENT_CHANGED")
+    -- equipment data isn't reliable until PLAYER_ENTERING_WORLD, so the
+    -- T5 scan from ADDON_LOADED gets a login-complete redo
+    events:RegisterEvent("PLAYER_ENTERING_WORLD")
+end
 events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
     if event == "ADDON_LOADED" then
         if arg1 ~= ADDON_NAME then return end
         LoadDB()
         RefreshKnown()
+        RefreshT5()
         LayoutDots()
         playerGUID = UnitGUID("player")
         frame:ClearAllPoints()
@@ -951,14 +1262,17 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
         -- reflects the fight, not the pre-pull standing around
         OOMReset()
         StartReport()
-        events:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
     elseif event == "PLAYER_REGEN_ENABLED" then
-        events:UnregisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+        LifePrune()
         FinishReport()
     elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
         HandleCombatLog(CombatLogGetCurrentEventInfo())
     elseif event == "SPELLS_CHANGED" then
         RefreshKnown()
+        LayoutDots()
+    elseif event == "PLAYER_EQUIPMENT_CHANGED"
+        or event == "PLAYER_ENTERING_WORLD" then
+        RefreshT5()
         LayoutDots()
     elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
         -- arg3 is the rank-specific spell id; match by name
@@ -968,12 +1282,8 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3)
                 if sName == name then
                     justCast[key] = GetTime()
                     justCastGUID[key] = UnitGUID("target")
-                    if report.active then
-                        if key == "mindblast" then
-                            report.mb = report.mb + 1
-                        elseif key == "swd" then
-                            report.swd = report.swd + 1
-                        end
+                    if report.active and report.casts[key] then
+                        report.casts[key] = report.casts[key] + 1
                     end
                     break
                 end
@@ -1021,18 +1331,19 @@ SlashCmdList.NEXTCAST = function(input)
         else
             Print("Usage: /nc scale 0.5–3")
         end
-    elseif cmd == "swd" then
+    -- priest-only toggles fall through to the help text on a druid
+    elseif cmd == "swd" and IS_PRIEST then
         db.useSWD = not db.useSWD
         Print("Shadow Word: Death suggestions " .. (db.useSWD and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
-    elseif cmd == "ve" then
+    elseif cmd == "ve" and IS_PRIEST then
         db.useVE = not db.useVE
         LayoutDots()
-        Print("Vampiric Embrace suggestions " .. (db.useVE and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
-    elseif cmd == "racial" then
+        Print("Vampiric Embrace in the boss rotation " .. (db.useVE and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
+    elseif cmd == "racial" and IS_PRIEST then
         db.useRacial = not db.useRacial
         LayoutDots()
         Print("Racial DoT suggestions (Devouring Plague/Starshards) " .. (db.useRacial and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
-    elseif cmd == "focus" then
+    elseif cmd == "focus" and IS_PRIEST then
         db.useFocus = not db.useFocus
         Print("Inner Focus pairing alerts " .. (db.useFocus and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
     elseif cmd == "ttd" then
@@ -1041,13 +1352,13 @@ SlashCmdList.NEXTCAST = function(input)
     elseif cmd == "report" then
         db.useReport = not db.useReport
         Print("Post-fight reports " .. (db.useReport and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
-    elseif cmd == "fiend" then
+    elseif cmd == "mana" or cmd == "fiend" then -- "fiend" kept as an alias
         db.useFiend = not db.useFiend
-        Print("Shadowfiend suggestions " .. (db.useFiend and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
+        Print("Low-mana cooldown (" .. (IS_PRIEST and "Shadowfiend" or "Innervate") .. ") suggestions " .. (db.useFiend and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
     elseif cmd == "lust" then
         db.useLust = not db.useLust
         Print("Potion/trinket alerts during Bloodlust/Heroism " .. (db.useLust and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
-    elseif cmd == "clip" then
+    elseif cmd == "clip" and IS_PRIEST then
         db.useClip = not db.useClip
         Print("Mind Flay clip indicator " .. (db.useClip and "|cff00ff00on|r" or "|cffff0000off|r") .. ".")
     elseif cmd == "oom" then
@@ -1059,12 +1370,16 @@ SlashCmdList.NEXTCAST = function(input)
         Print("  /nc hide | show — hide or show the box")
         Print("  /nc reset — reset position")
         Print("  /nc scale <0.5–3> — resize")
-        Print("  /nc swd | ve | fiend — toggle those suggestions")
+        if IS_PRIEST then
+            Print("  /nc swd — toggle Shadow Word: Death suggestions")
+            Print("  /nc ve — add Vampiric Embrace to the boss rotation (off by default)")
+            Print("  /nc racial — toggle racial DoT suggestions (DP/Starshards)")
+            Print("  /nc focus — toggle Inner Focus pairing alerts")
+            Print("  /nc clip — toggle the Mind Flay clip indicator")
+        end
+        Print("  /nc mana — toggle the low-mana cooldown suggestion (" .. (IS_PRIEST and "Shadowfiend" or "Innervate") .. ")")
         Print("  /nc lust — toggle potion/trinket alerts during Lust/Heroism")
-        Print("  /nc clip — toggle the Mind Flay clip indicator")
         Print("  /nc oom — toggle the time-until-OOM display")
-        Print("  /nc racial — toggle racial DoT suggestions (DP/Starshards)")
-        Print("  /nc focus — toggle Inner Focus pairing alerts")
         Print("  /nc ttd — toggle the target time-to-die display")
         Print("  /nc report — toggle post-fight reports")
     end
